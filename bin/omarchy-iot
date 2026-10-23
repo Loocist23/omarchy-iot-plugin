@@ -96,6 +96,12 @@ shelly_object() {
         # falsy and would erase a legitimately off switch.
         on=$(jq -r --arg c "$comp" '.[$c].output' <<<"$status")
         power=$(jq -r --arg c "$comp" '.[$c].apower // null' <<<"$status")
+        # The web UI names the channel in the config (switch:0.name),
+        # not the device: sys.device.name stays null unless set via RPC.
+        [[ -n $name ]] || {
+          config=$(curl_json "http://$ip/rpc/Shelly.GetConfig")
+          [[ -n $config && $config == \{* ]] && name=$(jq -r --arg c "$comp" '.[$c].name // ""' <<<"$config")
+        }
       fi
     fi
   else
@@ -103,8 +109,14 @@ shelly_object() {
     status=$(curl_json "http://$ip/status")
     if [[ -n $status && $status == \{* ]] && jq -e '.relays' >/dev/null 2>&1 <<<"$status" 2>/dev/null; then
       gen=1; auth=false
-      name=$(jq -r '.name // ""' <<<"$status")
-      model=$(jq -r '.model // ""' <<<"$status")
+      # Gen1 never exposes the user-set name in /status; it lives in
+      # /settings (device name, then the channel name under it).
+      settings=$(curl_json "http://$ip/settings")
+      if [[ -n $settings && $settings == \{* ]]; then
+        name=$(jq -r '.name // ""' <<<"$settings")
+        model=$(jq -r '.device.type // ""' <<<"$settings")
+        [[ -n $name ]] || name=$(jq -r '(.relays // [])[0].name // (.lights // [])[0].name // ""' <<<"$settings")
+      fi
       on=$(jq -r '.relays[0].ison' <<<"$status")
       power=$(jq -r '.meters[0].power // null' <<<"$status")
     else
