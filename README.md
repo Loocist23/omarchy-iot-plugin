@@ -54,6 +54,30 @@ omarchy-iot toggle <ip>
 ## Requirements
 
 `curl`, `jq`, `avahi` (avahi-browse) — all part of a standard Omarchy install.
+No other external dependencies.
+
+## Installation
+
+```
+omarchy plugin add https://github.com/Loocist23/omarchy-iot-plugin.git --enable
+```
+
+Then place the widget on the bar (right section, next to the network widgets):
+
+```
+omarchy bar move loocist.iot --section right --index 5
+```
+
+## Removal
+
+```
+omarchy plugin disable loocist.iot
+omarchy plugin remove loocist.iot --yes
+```
+
+`omarchy plugin remove` disables the plugin first, then deletes the cloned
+repo from `~/.config/omarchy/plugins/loocist.iot`. The upstream repository is
+untouched, so the plugin can be reinstalled with the install command above.
 
 ## Extending
 
