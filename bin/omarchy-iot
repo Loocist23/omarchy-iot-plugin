@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+
+# omarchy-iot — local-network IoT discovery and control for the loocist.iot
+# Omarchy bar plugin.
+#
+# Ships inside the plugin directory and is invoked by absolute path, so the
+# plugin has nothing to install on PATH. It is a usable CLI on its own —
+# symlink it into ~/.local/bin if you want `omarchy-iot list` from a script.
+#
+#   list [--cache <sec>]   JSON inventory of IoT-ish devices on the LAN.
+#                         --cache reuses the previous scan when it is fresher
+#                         than <sec> seconds (default 0 = always rescan).
+#   set <ip> <on|off>      switch the first channel of a Shelly device.
+#   toggle <ip>            flip the first channel of a Shelly device.
+#   status <ip>            one device, same shape as a `list` entry.
+#
+# Discovery rides on mDNS (avahi-browse), which the Shelly line advertises on
+# (service `_shelly._tcp`, plus `_http._tcp` for Gen1). Everything the helper
+# can identify but not drive (Home Assistant, Hue bridges, Freeboxes, ESPHome,
+# generic web UIs) is still listed, marked controllable:false — the panel
+# offers "open web UI" for those instead of a switch.
+#
+# Shelly API split: Gen1 speaks `/status` + `/relay/0?turn=on`, Gen2/Gen3
+# speak RPC (`/rpc/Shelly.GetStatus`, `/rpc/Switch.Set`). A device with
+# authentication enabled (auth_en) is shown but never driven.
+
+set -uo pipefail
+
+MDNS_TIMEOUT="${IOT_MDNS_TIMEOUT:-2}"
+CURL_TIMEOUT="${IOT_CURL_TIMEOUT:-2}"
+CACHE_FILE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-iot-last.json"
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "{\"ok\":false,\"error\":\"$1 is required but not installed\"}"; exit 1; }; }
+need curl
+need jq
+need avahi-browse
+
+# avahi-browse -p escapes spaces in names as \032; undo that.
+unescape() { printf '%s' "$1" | sed 's/\\032/ /g'; }
+
+curl_json() { curl -s -m "$CURL_TIMEOUT" --max-time "$CURL_TIMEOUT" "$1" 2>/dev/null; }
+
+# --- vendor guessing ---------------------------------------------------------
+
+vendor_of() {
+  local name=$1 service=$2
+  case "$name" in
+  shelly*) echo "Shelly" ;;
+  esphome*) echo "ESPHome" ;;
+  tasmota*) echo "Tasmota" ;;
+  hue* | philips-hue*) echo "Philips Hue" ;;
+  homeassistant* | home-assistant* | hass*) echo "Home Assistant" ;;
+  freebox*) echo "Freebox" ;;
+  *)
+    case "$service" in
+    _shelly._tcp) echo "Shelly" ;;
+    _home-assistant._tcp) echo "Home Assistant" ;;
+    _hue._tcp) echo "Philips Hue" ;;
+    _hap._tcp) echo "HomeKit" ;;
+    _matter._tcp) echo "Matter" ;;
+    _esphome._tcp) echo "ESPHome" ;;
+    _sonos._tcp) echo "Sonos" ;;
+    *) echo "" ;;
+    esac
+    ;;
+  esac
+}
+
+# --- shelly ------------------------------------------------------------------
+
+# First switch/light component of a Gen2/Gen3 status payload:
+# prints "switch:0", "light:1", ... or empty.
+gen2_comp() {
+  jq -r 'to_entries | map(select(.key | test("^(switch|light):"))) | sort_by(.key) | (.[0].key // "")' <<<"$1" 2>/dev/null
+}
+
+# Build one device object for a Shelly found at $ip with mDNS name $mname.
+shelly_object() {
+  local ip=$1 mname=$2 txt=$3
+  local info status comp on power name model gen auth
+
+  info=$(curl_json "http://$ip/rpc/Shelly.GetDeviceInfo")
+  if [[ -n $info && $info == \{* ]] && jq -e '.id' >/dev/null 2>&1 <<<"$info"; then
+    # Gen2 / Gen3: RPC
+    name=$(jq -r '.name // ""' <<<"$info")
+    model=$(jq -r '.model // ""' <<<"$info")
+    gen=$(jq -r '.gen // ""' <<<"$info")
+    auth=$(jq -r '.auth_en // false' <<<"$info")
+
+    on=null; power=null
+    status=$(curl_json "http://$ip/rpc/Shelly.GetStatus")
+    if [[ -n $status && $status == \{* ]]; then
+      comp=$(gen2_comp "$status")
+      if [[ -n $comp ]]; then
+        # No `// null` here: jq's alternative operator treats `false` as
+        # falsy and would erase a legitimately off switch.
+        on=$(jq -r --arg c "$comp" '.[$c].output' <<<"$status")
+        power=$(jq -r --arg c "$comp" '.[$c].apower // null' <<<"$status")
+      fi
+    fi
+  else
+    # Gen1: /status
+    status=$(curl_json "http://$ip/status")
+    if [[ -n $status && $status == \{* ]] && jq -e '.relays' >/dev/null 2>&1 <<<"$status" 2>/dev/null; then
+      gen=1; auth=false
+      name=$(jq -r '.name // ""' <<<"$status")
+      model=$(jq -r '.model // ""' <<<"$status")
+      on=$(jq -r '.relays[0].ison' <<<"$status")
+      power=$(jq -r '.meters[0].power // null' <<<"$status")
+    else
+      # Advertised as Shelly but unreachable over HTTP right now.
+      jq -n --arg ip "$ip" --arg name "$mname" \
+        '{id:$ip, ip:$ip, name:$name, vendor:"Shelly", model:"", gen:null,
+          kind:"shelly", controllable:false, locked:false, reachable:false,
+          on:null, power:null}'
+      return
+    fi
+  fi
+
+  [[ -n $name ]] || name=$mname
+
+  jq -n \
+    --arg id "$ip" --arg ip "$ip" --arg name "$name" \
+    --arg model "$model" --argjson gen "${gen:-null}" --argjson auth "${auth:-false}" \
+    --argjson on "${on:-null}" --argjson power "${power:-null}" \
+    '{id:$id, ip:$ip, name:$name, vendor:"Shelly", model:$model, gen:$gen,
+      kind:"shelly", controllable:($on != null) and ($auth | not),
+      locked:$auth, reachable:true, on:$on, power:$power}'
+}
+
+# Generic device: identified, visible, not drivable from here.
+generic_object() {
+  local ip=$1 name=$2 vendor=$3
+  jq -n --arg id "$ip" --arg ip "$ip" --arg name "$name" --arg vendor "$vendor" \
+    '{id:$id, ip:$ip, name:$name, vendor:($vendor | if . == "" then "Unknown" else . end),
+      model:"", gen:null, kind:"generic", controllable:false, locked:false,
+      reachable:true, on:null, power:null}'
+}
+
+# --- discovery ---------------------------------------------------------------
+
+cmd_list() {
+  local cache_sec=0
+  if [[ ${1:-} == "--cache" ]]; then
+    cache_sec=${2:-0}
+    if [[ -f $CACHE_FILE ]]; then
+      local age
+      age=$(( $(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0) ))
+      if (( age <= cache_sec )); then
+        cat "$CACHE_FILE"
+        return 0
+      fi
+    fi
+  fi
+
+  local tmp
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+
+  # =;iface;family;name;service;domain;host;ip;port;txt
+  timeout "$MDNS_TIMEOUT" avahi-browse -arp 2>/dev/null \
+    | awk -F';' '$1 == "=" && $8 != "" { print $3 "|" $4 "|" $5 "|" $8 }' \
+    | sort -u >"$tmp/found"
+
+  local n=0
+  while IFS='|' read -r family rawname service ip; do
+    [[ $family == IPv4 ]] || continue
+    name=$(unescape "$rawname")
+
+    local vendor
+    vendor=$(vendor_of "$name" "$service")
+
+    if [[ $vendor == Shelly ]]; then
+      shelly_object "$ip" "$name" "" >"$tmp/$n.json" &
+    else
+      # Everything else on a LAN-interesting service type: keep it, offer
+      # the web UI, drive nothing.
+      case "$service" in
+      _http._tcp | _home-assistant._tcp | _hue._tcp | _hap._tcp | _matter._tcp | _esphome._tcp | _sonos._tcp)
+        generic_object "$ip" "$name" "$vendor" >"$tmp/$n.json" &
+        ;;
+      esac
+    fi
+    n=$(( n + 1 ))
+  done <"$tmp/found"
+
+  wait
+
+  local out
+  if compgen -G "$tmp/[0-9]*.json" >/dev/null; then
+    out=$(jq -s '{ok:true, devices:(unique_by(.ip) | sort_by(.vendor, .name))}' "$tmp"/*.json)
+  else
+    out='{"ok":true,"devices":[]}'
+  fi
+
+  trap - EXIT
+  rm -rf "$tmp"
+
+  printf '%s' "$out" >"$CACHE_FILE"
+  printf '%s' "$out"
+}
+
+# --- control -----------------------------------------------------------------
+
+# Find the drivable component of the device at $ip.
+# Prints "gen1:relay" / "gen1:light" / "gen2:switch:0" / "gen2:light:0" or empty.
+find_component() {
+  local ip=$1 info status comp
+  info=$(curl_json "http://$ip/rpc/Shelly.GetDeviceInfo")
+  if [[ -n $info && $info == \{* ]] && jq -e '.id' >/dev/null 2>&1 <<<"$info"; then
+    if [[ $(jq -r '.auth_en // false' <<<"$info") == true ]]; then
+      echo "locked"
+      return
+    fi
+    status=$(curl_json "http://$ip/rpc/Shelly.GetStatus")
+    comp=$(gen2_comp "$status")
+    [[ -n $comp ]] && echo "gen2:$comp"
+    return
+  fi
+  status=$(curl_json "http://$ip/status")
+  if [[ -n $status && $status == \{* ]]; then
+    if jq -e '(.relays // [])[0]' >/dev/null 2>&1 <<<"$status"; then
+      echo "gen1:relay"
+    elif jq -e '(.lights // [])[0]' >/dev/null 2>&1 <<<"$status"; then
+      echo "gen1:light"
+    fi
+  fi
+}
+
+cmd_set() {
+  local ip=$1 state=$2 comp kind prefix id on
+  [[ $state == on || $state == off ]] || { echo '{"ok":false,"error":"state must be on or off"}'; exit 1; }
+
+  comp=$(find_component "$ip")
+  case "$comp" in
+  locked) echo '{"ok":false,"error":"device requires authentication"}'; exit 1 ;;
+  "") echo '{"ok":false,"error":"not a drivable Shelly device"}'; exit 1 ;;
+  esac
+
+  kind=${comp%%:*}
+  local rest=${comp#*:}
+  local compkind=${rest%%:*}
+  id=${rest##*:}
+
+  local body=""
+  if [[ $kind == gen2 ]]; then
+    local api="Switch.Set" bool
+    [[ $compkind == light ]] && api="Light.Set"
+    bool=$([[ $state == on ]] && echo true || echo false)
+    body=$(curl_json "http://$ip/rpc/$api?id=$id&on=$bool")
+  else
+    local channel="relay"
+    [[ $compkind == light ]] && channel="light"
+    body=$(curl_json "http://$ip/$channel/$id?turn=$state")
+  fi
+
+  # Trust nothing: read the channel back and report what it actually is now.
+  sleep 0.3
+  local now
+  now=$(read_state "$ip")
+  if [[ -n $now ]]; then
+    local ison
+    ison=$(jq -r '.on' <<<"$now")
+    if [[ $ison == true || $ison == false ]]; then
+      jq -n --argjson on "$ison" '{ok:true, on:$on}'
+      exit 0
+    fi
+  fi
+
+  # Fall back to the command's own response shape when read-back failed.
+  if [[ -n $body && $body == \{* ]]; then
+    if [[ $kind == gen2 ]]; then
+      jq -n --argjson was "$(jq -r '.was_on // "null"' <<<"$body")" \
+        '{ok:true, on:($was | if . == null then null else ($was | not) end)}'
+    else
+      jq -n --argjson ison "$(jq -r '.ison // "null"' <<<"$body")" '{ok:true, on:$ison}'
+    fi
+  else
+    echo '{"ok":false,"error":"device did not answer"}'
+    exit 1
+  fi
+}
+
+read_state() {
+  local ip=$1 info status comp out attempt
+  # The device can take a beat to answer right after a switch flip, so try
+  # twice before giving up rather than reporting an unknown state.
+  for attempt in 1 2; do
+    info=$(curl_json "http://$ip/rpc/Shelly.GetDeviceInfo")
+    if [[ -n $info && $info == \{* ]] && jq -e '.id' >/dev/null 2>&1 <<<"$info"; then
+      status=$(curl_json "http://$ip/rpc/Shelly.GetStatus")
+      comp=$(gen2_comp "$status")
+      out=""
+      [[ -n $comp ]] && out=$(jq -c --arg c "$comp" '{on:(.[$c].output), power:(.[$c].apower)}' <<<"$status")
+      [[ -n $out ]] && { printf '%s' "$out"; return; }
+    else
+      status=$(curl_json "http://$ip/status")
+      if [[ -n $status && $status == \{* ]]; then
+        out=$(jq -c '{on:(.relays[0].ison), power:(.meters[0].power)}' <<<"$status" 2>/dev/null)
+        [[ -n $out ]] && { printf '%s' "$out"; return; }
+      fi
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+cmd_toggle() {
+  local ip=$1 now on
+  now=$(read_state "$ip")
+  # Plain `.on`: jq's `//` erases `false` (a legitimately off switch) as
+  # though it were null, which would make every off device "unreadable".
+  if [[ -n $now ]]; then
+    on=$(jq -r '.on' <<<"$now")
+  else
+    on=null
+  fi
+  if [[ $on != true && $on != false ]]; then
+    echo '{"ok":false,"error":"cannot read the current state of the device"}'
+    exit 1
+  fi
+  cmd_set "$ip" $([[ $on == true ]] && echo off || echo on)
+}
+
+cmd_status() {
+  shelly_object "$1" "$(avahi-browse -arp 2>/dev/null | grep "$1" | head -1)" ""
+}
+
+case "${1:-}" in
+list) shift; cmd_list "$@" ;;
+set) cmd_set "${2:?missing ip}" "${3:?missing state}" ;;
+toggle) cmd_toggle "${2:?missing ip}" ;;
+status) cmd_status "${2:?missing ip}" ;;
+*)
+  echo "usage: omarchy-iot list [--cache <sec>] | set <ip> <on|off> | toggle <ip> | status <ip>"
+  exit 1
+  ;;
+esac

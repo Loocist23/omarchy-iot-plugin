@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "id": "loocist.iot",
+  "name": "IoT",
+  "version": "0.1.0",
+  "author": "loocist",
+  "license": "MIT",
+  "description": "Discover and control IoT devices on the LAN: mDNS discovery plus full Shelly switch control (Gen1-3), straight from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "IoT",
+    "description": "Scan the LAN for IoT devices, toggle Shelly switches, read live power, open any device's web UI.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "pollIntervalSec": 10,
+      "backgroundIntervalSec": 120,
+      "hideWhenEmpty": false
+    },
+    "schema": [
+      {
+        "key": "pollIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval while open (seconds)",
+        "min": 3,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "backgroundIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval while closed (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 10,
+        "defaultValue": 120
+      },
+      {
+        "key": "hideWhenEmpty",
+        "type": "boolean",
+        "label": "Hide the icon when no device is found",
+        "defaultValue": false
+      }
+    ]
+  }
+}
